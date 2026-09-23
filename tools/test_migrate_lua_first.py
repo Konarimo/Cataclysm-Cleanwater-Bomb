@@ -3455,10 +3455,15 @@ assert(not ok and string.find(message, 'stale_world', 1, true))
             {"u_add_var": "choice", "possible_values": ["only"]},
             "u_add_var", "u_owner",
         )
+        repeated_choice_lines = migrate_lua_first.render_static_character_variable(
+            {"u_add_var": "choice", "possible_values": ["left", "right"]},
+            "u_add_var", "u_owner",
+        )
         time_lines = migrate_lua_first.render_static_character_variable(
             {"u_add_var": "turn", "time": True}, "u_add_var", "u_owner",
         )
         self.assertIsNotNone(choice_lines)
+        self.assertIsNotNone(repeated_choice_lines)
         self.assertIsNotNone(time_lines)
         self.assertIn("services.random.int(1, #values)", "\n".join(choice_lines))
         self.assertNotIn("native_events.emit", "\n".join(time_lines))
@@ -3471,7 +3476,8 @@ assert(not ok and string.find(message, 'stale_world', 1, true))
         ))
         script = r"""
 local u_owner, npc_owner = {values={}}, {values={}}
-local events, random_calls, write_allowed = {}, 0, true
+local events, random_calls, write_allowed, random_index = {}, 0, true, 1
+local random_bounds = {}
 local services = {
     variables = {set=function(owner, key, value)
         if not write_allowed then return {ok=false} end
@@ -3485,8 +3491,11 @@ local services = {
     end},
     random = {int=function(first, last)
         random_calls = random_calls + 1
-        assert(first == 1 and last == 1)
-        return first
+        assert(first == 1 and last >= 1 and last <= 2)
+        random_bounds[#random_bounds + 1] = {first, last}
+        local result = random_index
+        random_index = random_index % last + 1
+        return result
     end},
     turn = function() return 1440 end,
 }
@@ -3501,26 +3510,44 @@ assert(npc_owner.values.context_val == "npc-ready")
 assert(#events == 2)
 assert(events[1].var == "u_val" and events[1].value == "ready")
 assert(events[2].var == "context_val" and events[2].value == "npc-ready")
+assert(random_calls == 0)
 do
 CHOICE_BODY
 end
 assert(u_owner.values.choice == "only")
 assert(random_calls == 1)
+assert(random_bounds[1][1] == 1 and random_bounds[1][2] == 1)
 assert(#events == 3 and events[3].var == "choice" and events[3].value == "only")
+do
+REPEATED_CHOICE_BODY
+end
+assert(u_owner.values.choice == "left")
+assert(random_calls == 2)
+assert(random_bounds[2][1] == 1 and random_bounds[2][2] == 2)
+assert(#events == 4 and events[4].value == "left")
+do
+REPEATED_CHOICE_BODY
+end
+assert(u_owner.values.choice == "right")
+assert(random_calls == 3)
+assert(random_bounds[3][1] == 1 and random_bounds[3][2] == 2)
+assert(#events == 5 and events[5].value == "right")
 do
 TIME_BODY
 end
 assert(u_owner.values.turn == "1440")
-assert(#events == 3)
+assert(#events == 5)
+assert(random_calls == 3)
 u_owner.values.u_val = "kept"
 write_allowed = false
 do
 BODY_U
 end
 assert(u_owner.values.u_val == "kept")
-assert(#events == 3)
+assert(#events == 5)
 """.replace("BODY_U", rendered["u_add_var"])
         script = script.replace("BODY_NPC", rendered["npc_add_var"])
+        script = script.replace("REPEATED_CHOICE_BODY", "\n".join(repeated_choice_lines))
         script = script.replace("CHOICE_BODY", "\n".join(choice_lines))
         script = script.replace("TIME_BODY", "\n".join(time_lines))
         executed = subprocess.run(["lua", "-"], input=script, text=True,
