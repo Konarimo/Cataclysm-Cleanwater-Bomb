@@ -23,6 +23,7 @@
 #include "lua_platform_handle.h"
 #include "lua_platform_mutations.h"
 #include "lua_platform_sol.h"
+#include "lua_platform_variables.h"
 #include "mutation.h"
 #include "npc.h"
 #include "options_helpers.h"
@@ -64,6 +65,18 @@ struct mutation_fixture {
                 throw std::runtime_error( "test: mutation outside write phase" );
             }
         } );
+        cata::lua_platform::install_variable_api(
+        services, [this]() {
+            return runtime;
+        }, [this]() {
+            return world;
+        }, []() {}, [this]() {
+            if( !writable ) {
+                throw std::runtime_error( "test: variable write outside write phase" );
+            }
+        }, []() {
+            return true;
+        } );
     }
 
     ~mutation_fixture() {
@@ -91,8 +104,16 @@ struct mutation_fixture {
         return condition( context );
     }
 
-    void legacy_effect( const std::string &source ) {
-        dialogue context( get_talker_for( player ), get_talker_for( other ) );
+    void legacy_effect( const std::string &source, const bool alpha_is_npc = false,
+                        const std::string &context_key = {}, const std::string &context_value = {} ) {
+        Character &alpha = alpha_is_npc ? static_cast<Character &>( other ) :
+                           static_cast<Character &>( player );
+        Character &beta = alpha_is_npc ? static_cast<Character &>( player ) :
+                          static_cast<Character &>( other );
+        dialogue context( get_talker_for( alpha ), get_talker_for( beta ) );
+        if( !context_key.empty() ) {
+            context.set_value( context_key, context_value );
+        }
         talk_effect_t effect;
         effect.parse_sub_effect( json_loader::from_string( source ).get_object(), "mutation_acceptance" );
         for( const talk_effect_fun_t &operation : effect.effects ) {
@@ -360,6 +381,11 @@ TEST_CASE( "lua_platform_mutation_erase_matches_native_base_trait_and_absence",
         old_target.set_mutation( trait_QUICK );
         new_target.set_mutation( trait_QUICK );
     }
+    Character &legacy_untouched = legacy.target( !npc_target );
+    Character &platform_untouched = platform.target( !npc_target );
+    legacy_untouched.set_mutation( trait_QUICK );
+    platform_untouched.set_mutation( trait_QUICK );
+    const bool untouched_base = platform_untouched.has_base_trait( trait_QUICK );
     const std::string effect = std::string( R"({")" ) +
                                ( npc_target ? "npc_" : "u_" ) + R"(lose_trait":"QUICK"})";
     for( int attempt = 0; attempt < 2; ++attempt ) {
@@ -371,6 +397,86 @@ TEST_CASE( "lua_platform_mutation_erase_matches_native_base_trait_and_absence",
         CHECK( old_target.has_trait( trait_QUICK ) == new_target.has_trait( trait_QUICK ) );
         CHECK( old_target.has_base_trait( trait_QUICK ) == new_target.has_base_trait( trait_QUICK ) );
         CHECK( new_target.has_base_trait( trait_QUICK ) == base );
+        CHECK( legacy_untouched.has_trait( trait_QUICK ) );
+        CHECK( platform_untouched.has_trait( trait_QUICK ) );
+        CHECK( legacy_untouched.has_trait( trait_QUICK ) == platform_untouched.has_trait( trait_QUICK ) );
+        CHECK( legacy_untouched.has_base_trait( trait_QUICK ) == platform_untouched.has_base_trait(
+                   trait_QUICK ) );
+        CHECK( platform_untouched.has_base_trait( trait_QUICK ) == untouched_base );
+    }
+}
+
+TEST_CASE( "lua_platform_mutation_replace_matches_legacy_context_values_for_alpha_npc",
+           "[lua][platform][mutations][semantic]" )
+{
+    mutation_fixture legacy( 3300 );
+    mutation_fixture platform( 3400 );
+    const trait_id hair( "artificial_hair_buzzcut" );
+    REQUIRE( hair.is_valid() );
+    const mutation_variant *red_variant = hair->variant( "red" );
+    const mutation_variant *black_variant = hair->variant( "black" );
+    const mutation_variant *white_variant = hair->variant( "white" );
+    REQUIRE( red_variant != nullptr );
+    REQUIRE( black_variant != nullptr );
+    REQUIRE( white_variant != nullptr );
+    const cata::lua_platform::game_handle alpha_npc = platform.handle( true );
+
+    SECTION( "dynamic_trait_id_and_static_variant" ) {
+        const std::string source =
+            R"({"u_add_trait":{"context_val":"trait_id"},"variant":"red"})";
+        legacy.legacy_effect( source, true, "trait_id", hair.str() );
+
+        sol::table context = platform.lua.create_table();
+        context["trait_id"] = hair.str();
+        sol::protected_function resolve = platform.services["variables"]["resolve"];
+        sol::protected_function_result resolved = resolve( context, sol::nil, "context", "trait_id" );
+        REQUIRE( resolved.valid() );
+        sol::table resolved_result = resolved;
+        REQUIRE( resolved_result["ok"].get<bool>() );
+        REQUIRE( resolved_result["value"]["exists"].get<bool>() );
+        const std::string id = resolved_result["value"]["value"].get<std::string>();
+        sol::protected_function replace = platform.services["mutations"]["replace"];
+        sol::protected_function_result call = replace( alpha_npc,
+                                              cata::lua_platform::script_game_id( "mutation", id ), "red" );
+        REQUIRE( call.valid() );
+        REQUIRE( call.get<sol::table>()["ok"].get<bool>() );
+        CHECK( legacy.other.has_trait( hair ) == platform.other.has_trait( hair ) );
+        CHECK( legacy.other.get_mutations_variants() == platform.other.get_mutations_variants() );
+        CHECK( legacy.other.has_trait( hair ) );
+        REQUIRE( legacy.other.get_mutations_variants().size() == 1 );
+        REQUIRE( platform.other.get_mutations_variants().size() == 1 );
+        CHECK( legacy.other.get_mutations_variants().front().variant == "red" );
+        CHECK( platform.other.get_mutations_variants().front().variant == "red" );
+        CHECK_FALSE( platform.player.has_trait( hair ) );
+    }
+
+    SECTION( "bionic_color_id_context_variant" ) {
+        legacy.other.set_mutation( hair, black_variant );
+        platform.other.set_mutation( hair, black_variant );
+        const std::string source =
+            R"({"u_add_trait":"artificial_hair_buzzcut","variant":{"context_val":"color_id"}})";
+        legacy.legacy_effect( source, true, "color_id", "white" );
+
+        sol::table context = platform.lua.create_table();
+        context["color_id"] = "white";
+        sol::protected_function resolve = platform.services["variables"]["resolve"];
+        sol::protected_function_result resolved = resolve( context, sol::nil, "context", "color_id" );
+        REQUIRE( resolved.valid() );
+        sol::table resolved_result = resolved;
+        REQUIRE( resolved_result["ok"].get<bool>() );
+        REQUIRE( resolved_result["value"]["exists"].get<bool>() );
+        const std::string variant = resolved_result["value"]["value"].get<std::string>();
+        CHECK( variant == white_variant->id );
+        sol::protected_function replace = platform.services["mutations"]["replace"];
+        sol::protected_function_result call = replace( alpha_npc,
+                                              cata::lua_platform::script_game_id( "mutation", hair.str() ), variant );
+        REQUIRE( call.valid() );
+        REQUIRE( call.get<sol::table>()["ok"].get<bool>() );
+        CHECK( legacy.other.get_mutations_variants() == platform.other.get_mutations_variants() );
+        REQUIRE( platform.other.get_mutations_variants().size() == 1 );
+        CHECK( platform.other.get_mutations_variants().front().trait == hair );
+        CHECK( platform.other.get_mutations_variants().front().variant == "white" );
+        CHECK_FALSE( platform.player.has_trait( hair ) );
     }
 }
 
