@@ -3434,9 +3434,15 @@ assert(not ok and string.find(message, 'stale_world', 1, true))
             self.assertNotIn("needs domain-service conversion", report)
             self.assertNotIn("services.state.", main)
 
-    def test_character_variable_keys_match_platform_byte_limit(self) -> None:
-        valid_names = ("a" * 128, "é" * 64)
-        invalid_names = ("a" * 129, "é" * 64 + "a", "", "bad\x1fkey")
+    def test_character_variable_keys_match_native_storage_domain(self) -> None:
+        valid_names = (
+            "a" * 4096,
+            "雪" * 512,
+            "",
+            "control\x01key",
+            "nul\x00key",
+        )
+        invalid_names = ("bad\ud800key",)
         for selector, target in (
             ("u_add_var", "u_owner"),
             ("npc_add_var", "npc_owner"),
@@ -3454,47 +3460,41 @@ assert(not ok and string.find(message, 'stale_world', 1, true))
                     )
                 )
 
-        valid_ascii, valid_utf8 = valid_names
-        invalid_ascii, invalid_utf8, _, _ = invalid_names
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "source.json"
-            source.write_text(json.dumps([
-                {
-                    "type": "effect_on_condition", "id": "u_remove_128",
+            objects = []
+            for index, name in enumerate(valid_names):
+                selector = "u_lose_var" if index % 2 == 0 else "npc_lose_var"
+                event = (
+                    "game_start" if selector == "u_lose_var" else "npc_becomes_hostile"
+                )
+                objects.append({
+                    "type": "effect_on_condition",
+                    "id": f"native_remove_{index}",
+                    "required_event": event,
+                    "effect": {selector: name},
+                })
+            for index, name in enumerate(invalid_names):
+                objects.append({
+                    "type": "effect_on_condition",
+                    "id": f"invalid_unicode_remove_{index}",
                     "required_event": "game_start",
-                    "effect": {"u_lose_var": valid_ascii},
-                },
-                {
-                    "type": "effect_on_condition", "id": "npc_remove_utf8_128",
-                    "required_event": "npc_becomes_hostile",
-                    "effect": {"npc_lose_var": valid_utf8},
-                },
-                {
-                    "type": "effect_on_condition", "id": "u_remove_129",
-                    "required_event": "game_start",
-                    "effect": {"u_lose_var": invalid_ascii},
-                },
-                {
-                    "type": "effect_on_condition", "id": "npc_remove_utf8_129",
-                    "required_event": "npc_becomes_hostile",
-                    "effect": {"npc_lose_var": invalid_utf8},
-                },
-            ]), encoding="utf-8")
+                    "effect": {"u_lose_var": name},
+                })
+            source.write_text(json.dumps(objects), encoding="utf-8")
             result = migrate_lua_first.migrate(
-                migrate_lua_first.load_objects([source]), "variable_key_limit_mod"
+                migrate_lua_first.load_objects([source]), "native_variable_key_mod"
             )
             main = result.files[Path("main.lua")]
-            self.assertEqual(len(result.partial), 2)
-            self.assertIn(
-                f'services.variables.remove(actor, {migrate_lua_first.lua_quote(valid_ascii)})',
-                main,
-            )
-            self.assertIn(
-                f'services.variables.remove(actor, {migrate_lua_first.lua_quote(valid_utf8)})',
-                main,
-            )
-            self.assertNotIn(migrate_lua_first.lua_quote(invalid_ascii), main)
-            self.assertNotIn(migrate_lua_first.lua_quote(invalid_utf8), main)
+            self.assertEqual(len(result.partial), len(invalid_names))
+            for name in valid_names:
+                self.assertIn(
+                    "services.variables.remove(actor, "
+                    f"{migrate_lua_first.lua_quote(name)})",
+                    main,
+                )
+            for name in invalid_names:
+                self.assertNotIn(migrate_lua_first.lua_quote(name), main)
 
     @unittest.skipUnless(shutil.which("lua"), "Lua interpreter required")
     def test_character_variable_add_preserves_changed_events(self) -> None:
@@ -3565,6 +3565,23 @@ assert(not ok and string.find(message, 'stale_world', 1, true))
             {"u_add_var": "wide", "possible_values": wide_values},
             "u_add_var", "u_owner",
         )
+        wide_key = "nul\x00control\x01" + "键" * 512
+        wide_value = "start\x00middle\x02" + "值" * 4096
+        wide_literal_lines = migrate_lua_first.render_static_character_variable(
+            {"u_add_var": wide_key, "value": wide_value},
+            "u_add_var", "u_owner",
+        )
+        wide_candidate_value = "candidate\x00value" + "候选" * 4096
+        wide_candidate_lines = migrate_lua_first.render_static_character_variable(
+            {
+                "u_add_var": "wide_candidate",
+                "possible_values": ["small", wide_candidate_value],
+            },
+            "u_add_var", "u_owner",
+        )
+        empty_lines = migrate_lua_first.render_static_character_variable(
+            {"u_add_var": "", "value": ""}, "u_add_var", "u_owner",
+        )
         self.assertIsNotNone(choice_lines)
         self.assertIsNotNone(repeated_choice_lines)
         self.assertIsNotNone(time_lines)
@@ -3573,6 +3590,9 @@ assert(not ok and string.find(message, 'stale_world', 1, true))
         self.assertIsNotNone(time_override_lines)
         self.assertIsNotNone(time_empty_candidates_lines)
         self.assertIsNotNone(wide_lines)
+        self.assertIsNotNone(wide_literal_lines)
+        self.assertIsNotNone(wide_candidate_lines)
+        self.assertIsNotNone(empty_lines)
         self.assertIn("services.random.int(0, #values - 1) + 1", "\n".join(choice_lines))
         self.assertIn("services.random.int(0, #values - 1) + 1", "\n".join(wide_lines))
         self.assertIn('"candidate-a", "candidate-b"', "\n".join(priority_lines))
@@ -3604,10 +3624,14 @@ assert(not ok and string.find(message, 'stale_world', 1, true))
             "u_add_var", "u_owner",
         ))
         self.assertIsNone(migrate_lua_first.render_static_character_variable(
-            {"u_add_var": "large", "value": "x" * 1025}, "u_add_var", "u_owner",
+            {"u_add_var": "bad\ud800key", "value": "ok"}, "u_add_var", "u_owner",
         ))
         self.assertIsNone(migrate_lua_first.render_static_character_variable(
-            {"u_add_var": "large", "possible_values": ["x" * 1025]},
+            {"u_add_var": "invalid_value", "value": "bad\ud800value"},
+            "u_add_var", "u_owner",
+        ))
+        self.assertIsNone(migrate_lua_first.render_static_character_variable(
+            {"u_add_var": "invalid_candidate", "possible_values": ["bad\ud800value"]},
             "u_add_var", "u_owner",
         ))
         script = r"""
@@ -3707,13 +3731,33 @@ assert(u_owner.values.wide == "wide-64")
 assert(random_calls == 5)
 assert(random_bounds[5][1] == 0 and random_bounds[5][2] == 64)
 assert(#events == 8 and events[8].var == "wide" and events[8].value == "wide-64")
+do
+WIDE_LITERAL_BODY
+end
+assert(u_owner.values[WIDE_LITERAL_KEY] == WIDE_LITERAL_VALUE)
+assert(#events == 9 and events[9].var == WIDE_LITERAL_KEY and
+    events[9].value == WIDE_LITERAL_VALUE)
+random_index = 1
+do
+WIDE_CANDIDATE_BODY
+end
+assert(u_owner.values.wide_candidate == WIDE_CANDIDATE_VALUE)
+assert(random_calls == 6)
+assert(random_bounds[6][1] == 0 and random_bounds[6][2] == 1)
+assert(#events == 10 and events[10].var == "wide_candidate" and
+    events[10].value == WIDE_CANDIDATE_VALUE)
+do
+EMPTY_BODY
+end
+assert(u_owner.values[""] == "")
+assert(#events == 11 and events[11].var == "" and events[11].value == "")
 u_owner.values.u_val = "kept"
 write_allowed = false
 do
 BODY_U
 end
 assert(u_owner.values.u_val == "kept")
-assert(#events == 8)
+assert(#events == 11)
 """.replace("BODY_U", rendered["u_add_var"])
         script = script.replace("BODY_NPC", rendered["npc_add_var"])
         script = script.replace("REPEATED_CHOICE_BODY", "\n".join(repeated_choice_lines))
@@ -3726,6 +3770,14 @@ assert(#events == 8)
             "TIME_EMPTY_CANDIDATES_BODY", "\n".join(time_empty_candidates_lines)
         )
         script = script.replace("WIDE_BODY", "\n".join(wide_lines))
+        script = script.replace("WIDE_LITERAL_BODY", "\n".join(wide_literal_lines))
+        script = script.replace("WIDE_CANDIDATE_BODY", "\n".join(wide_candidate_lines))
+        script = script.replace("EMPTY_BODY", "\n".join(empty_lines))
+        script = script.replace("WIDE_LITERAL_KEY", migrate_lua_first.lua_quote(wide_key))
+        script = script.replace("WIDE_LITERAL_VALUE", migrate_lua_first.lua_quote(wide_value))
+        script = script.replace(
+            "WIDE_CANDIDATE_VALUE", migrate_lua_first.lua_quote(wide_candidate_value)
+        )
         executed = subprocess.run(["lua", "-"], input=script, text=True,
                                   capture_output=True, timeout=10)
         self.assertEqual(executed.returncode, 0, executed.stderr)
